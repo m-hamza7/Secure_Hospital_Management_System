@@ -123,3 +123,18 @@ def anonymize_fields(name: str, contact: str, use_encryption: bool = False) -> T
         return encrypt_value(name, f), encrypt_value(contact, f)
     # Masking fallback
     return mask_name(name), mask_contact(contact)
+
+
+def is_encrypted(value: str) -> bool:
+    """Check if a value appears to be a Fernet encrypted token.
+    
+    Fernet tokens are base64-encoded and typically start with 'gAAAAA' prefix.
+    Returns True if the value looks like an encrypted token, False otherwise.
+    """
+    if not value or not isinstance(value, str):
+        return False
+    # Fernet tokens are typically long base64 strings starting with 'gAAAAA'
+    # and contain characters typical of base64 encoding
+    if len(value) > 50 and value.startswith('gAAAAA'):
+        return True
+    return False

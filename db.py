@@ -19,7 +19,7 @@ NOTE: All SQL uses parameterized queries to mitigate injection.
 from __future__ import annotations
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 
 from security import generate_salt, hash_password, anonymize_fields
@@ -83,6 +83,13 @@ def init_db() -> None:
         """
     )
 
+    # Ensure patients table has a 'deleted' column for soft-deletes (added for GDPR retention UI)
+    cur.execute("PRAGMA table_info(patients)")
+    existing_cols = [r[1] for r in cur.fetchall()]
+    if 'deleted' not in existing_cols:
+        # Add a small-int flag default 0 (not deleted)
+        cur.execute("ALTER TABLE patients ADD COLUMN deleted INTEGER DEFAULT 0")
+
     # Sample users if empty
     cur.execute("SELECT COUNT(*) AS c FROM users")
     if cur.fetchone()["c"] == 0:
@@ -144,6 +151,17 @@ def get_user_by_username(username: str) -> Optional[sqlite3.Row]:
     row = cur.fetchone()
     conn.close()
     return row
+
+
+def get_username_by_id(user_id: Optional[int]) -> Optional[str]:
+    """Return username for a given user_id, or None if not found or user_id is None."""
+    if user_id is None:
+        return None
+    conn = get_connection()
+    cur = conn.execute("SELECT username FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row["username"] if row else None
 
 
 def log_action(user_id: Optional[int], role: Optional[str], action: str, details: str = "") -> None:
@@ -218,25 +236,26 @@ def fetch_patients_for_role(role: str) -> List[Dict[str, Any]]:
     - admin: sees all raw + anonymized columns
     - doctor: sees anonymized_name/contact (only anonymized data) + diagnosis + date
     - receptionist: sees patient_id, name (raw for editing forms) but contact hidden in listing; diagnosis
+    Soft-deleted rows (deleted=1) are excluded from standard listings.
     """
     conn = get_connection()
     cur = conn.cursor()
     if role == "admin":
         cur.execute(
-            "SELECT patient_id, name, contact, diagnosis, anonymized_name, anonymized_contact, date_added FROM patients ORDER BY patient_id DESC"
+            "SELECT patient_id, name, contact, diagnosis, anonymized_name, anonymized_contact, date_added FROM patients WHERE COALESCE(deleted,0)=0 ORDER BY patient_id DESC"
         )
     elif role == "doctor":
         cur.execute(
-            "SELECT patient_id, anonymized_name AS name, anonymized_contact AS contact, diagnosis, date_added FROM patients ORDER BY patient_id DESC"
+            "SELECT patient_id, anonymized_name AS name, anonymized_contact AS contact, diagnosis, date_added FROM patients WHERE COALESCE(deleted,0)=0 ORDER BY patient_id DESC"
         )
     elif role == "receptionist":
         # Provide limited raw view (no contact displayed) for editing purpose name shown
         cur.execute(
-            "SELECT patient_id, name, NULL AS contact, diagnosis, date_added FROM patients ORDER BY patient_id DESC"
+            "SELECT patient_id, name, NULL AS contact, diagnosis, date_added FROM patients WHERE COALESCE(deleted,0)=0 ORDER BY patient_id DESC"
         )
     else:
         cur.execute(
-            "SELECT patient_id, anonymized_name AS name, anonymized_contact AS contact, diagnosis, date_added FROM patients ORDER BY patient_id DESC"
+            "SELECT patient_id, anonymized_name AS name, anonymized_contact AS contact, diagnosis, date_added FROM patients WHERE COALESCE(deleted,0)=0 ORDER BY patient_id DESC"
         )
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
@@ -303,6 +322,109 @@ def export_patients_csv(path: str = "patients_export.csv") -> bool:
         return False
 
 
+def soft_delete_patient(patient_id: int) -> bool:
+    """Mark a patient as deleted (soft delete). Returns True on success."""
+    try:
+        conn = get_connection()
+        conn.execute("UPDATE patients SET deleted = 1 WHERE patient_id = ?", (patient_id,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def recover_patient(patient_id: int) -> bool:
+    """Recover a previously soft-deleted patient (unset deleted flag)."""
+    try:
+        conn = get_connection()
+        conn.execute("UPDATE patients SET deleted = 0 WHERE patient_id = ?", (patient_id,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def list_deleted_patients() -> List[Dict[str, Any]]:
+    """Return patient rows that are soft-deleted."""
+    conn = get_connection()
+    cur = conn.execute(
+        "SELECT patient_id, name, contact, diagnosis, anonymized_name, anonymized_contact, date_added FROM patients WHERE COALESCE(deleted,0)=1 ORDER BY patient_id DESC"
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def permanently_delete_patient(patient_id: int) -> bool:
+    """Permanently remove a patient row from the database. Use with caution."""
+    try:
+        conn = get_connection()
+        conn.execute("DELETE FROM patients WHERE patient_id = ?", (patient_id,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def count_soft_deletes_older_than(days: int) -> int:
+    """Return number of soft-deleted patients older than given days."""
+    conn = get_connection()
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    cur = conn.execute(
+        "SELECT COUNT(*) AS c FROM patients WHERE COALESCE(deleted,0)=1 AND date_added < ?",
+        (cutoff,)
+    )
+    val = cur.fetchone()["c"]
+    conn.close()
+    return int(val)
+
+
+def purge_soft_deletes_older_than(days: int) -> int:
+    """Permanently delete soft-deleted patients older than `days`. Returns count removed."""
+    try:
+        conn = get_connection()
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cur = conn.execute(
+            "SELECT patient_id FROM patients WHERE COALESCE(deleted,0)=1 AND date_added < ?",
+            (cutoff,)
+        )
+        rows = cur.fetchall()
+        ids = [r["patient_id"] for r in rows]
+        if not ids:
+            conn.close()
+            return 0
+        for pid in ids:
+            conn.execute("DELETE FROM patients WHERE patient_id = ?", (pid,))
+        conn.commit()
+        conn.close()
+        return len(ids)
+    except Exception:
+        return 0
+
+
+# Ensure older databases get the 'deleted' column if it was added after DB creation
+def ensure_deleted_column_exists() -> None:
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(patients)")
+        cols = [r[1] for r in cur.fetchall()]
+        if 'deleted' not in cols:
+            cur.execute("ALTER TABLE patients ADD COLUMN deleted INTEGER DEFAULT 0")
+            conn.commit()
+        conn.close()
+    except Exception:
+        # Don't raise here; fail silently to preserve availability — UI will show errors if operations hit this.
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 # Initialize database at import time (first run convenience)
 if not os.path.exists(DB_FILE):
     init_db()
+# Make sure column exists for older DB files as well
+ensure_deleted_column_exists()
