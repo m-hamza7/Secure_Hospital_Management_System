@@ -12,7 +12,7 @@ import os
 import base64
 import hashlib
 import secrets
-from typing import Tuple
+from typing import Tuple, Optional
 
 try:
     from cryptography.fernet import Fernet
@@ -64,7 +64,7 @@ def mask_contact(contact: str) -> str:
     return "X" * (len(digits) - 3) + digits[-3:]
 
 
-def load_or_create_fernet_key() -> bytes | None:
+def load_or_create_fernet_key() -> Optional[bytes]:
     """Load existing Fernet key or create a new one.
 
     Returns None if cryptography not available.
@@ -84,7 +84,7 @@ def load_or_create_fernet_key() -> bytes | None:
     return key
 
 
-def get_fernet() -> Fernet | None:
+def get_fernet() -> Optional[Fernet]:
     """Return a Fernet instance if cryptography available; else None."""
     key = load_or_create_fernet_key()
     if key and _CRYPTO_AVAILABLE:
@@ -92,7 +92,7 @@ def get_fernet() -> Fernet | None:
     return None
 
 
-def encrypt_value(value: str, f: Fernet | None) -> str:
+def encrypt_value(value: str, f: Optional[Fernet]) -> str:
     """Encrypt value with Fernet if available; else return placeholder masked value."""
     if not value:
         return value
@@ -102,7 +102,7 @@ def encrypt_value(value: str, f: Fernet | None) -> str:
     return token.decode("utf-8")
 
 
-def decrypt_value(token: str, f: Fernet | None) -> str:
+def decrypt_value(token: str, f: Optional[Fernet]) -> str:
     """Decrypt Fernet token if possible; else return original token."""
     if f is None:
         return token

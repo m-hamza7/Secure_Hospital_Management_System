@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 import traceback
 import streamlit as st
 import pandas as pd
+import json
 
 from db import (
     get_user_by_username,
@@ -40,7 +41,7 @@ from db import (
     get_active_users_count,
     signup_user,
 )
-from security import verify_password, get_fernet, encrypt_value, is_encrypted
+from security import verify_password, get_fernet, encrypt_value, decrypt_value, is_encrypted
 
 
 # ----------------------------------------------------------------------------
@@ -67,41 +68,94 @@ if "show_signup" not in st.session_state:
 
 
 def init_session_from_query_params():
-    """Initialize session state from query parameters to persist across refreshes."""
+    """Initialize session state from query parameters to persist across refreshes.
+
+    Security rules:
+    - Do NOT accept raw `user`, `uid`, `role` query params for authentication.
+    - Only restore auth from a validated encrypted `session` token created by update_query_params().
+    - Consent (non-sensitive) may still be restored from `consent` param.
+    """
     if not st.session_state.session_initialized:
+        # Use the stable API `st.query_params` instead of deprecated experimental getter
         query_params = st.query_params
-        
-        # Restore auth state from query params
-        if "user" in query_params and "role" in query_params and "uid" in query_params:
-            username = query_params["user"]
-            role = query_params["role"]
-            user_id = query_params["uid"]
-            
-            # Verify the user still exists in database
+
+        # Restore consent if present (non-sensitive)
+        consent_vals = query_params.get("consent")
+        if consent_vals:
+            st.session_state.consent_given = str(consent_vals[0]) == "1"
+            st.session_state.consent_declined = not st.session_state.consent_given
+
+        # Securely restore session only from encrypted token
+        session_vals = query_params.get("session")
+        if session_vals:
+            token = session_vals[0]
             try:
-                user_row = get_user_by_username(username)
-                if user_row and str(user_row["user_id"]) == user_id and user_row["role"] == role:
-                    st.session_state.auth_user = username
-                    st.session_state.role = role
-                    st.session_state.user_id = int(user_id)
-                    st.session_state.consent_given = query_params.get("consent", "0") == "1"
+                f = get_fernet()
+                if f is not None:
+                    payload_json = decrypt_value(token, f)
+                    # payload should be a JSON string
+                    payload = json.loads(payload_json)
+                    # Basic checks: expected fields and freshness (24h)
+                    ts = float(payload.get("ts", 0))
+                    if time.time() - ts <= 86400:  # 24 hours
+                        username = payload.get("user")
+                        role = payload.get("role")
+                        user_id = payload.get("uid")
+                        # verify against DB to ensure user still exists and role matches
+                        user_row = None
+                        try:
+                            user_row = get_user_by_username(username)
+                        except Exception:
+                            user_row = None
+                        if (
+                            user_row
+                            and str(user_row["user_id"]) == str(user_id)
+                            and user_row["role"] == role
+                        ):
+                            st.session_state.auth_user = username
+                            st.session_state.role = role
+                            st.session_state.user_id = int(user_id)
+                # If Fernet not available or validation fails, do NOT set auth state from URL
             except Exception:
-                pass  # Fail silently and require re-login
-        
+                # Invalid token or decrypt error -> ignore silently (require login)
+                pass
+
         st.session_state.session_initialized = True
 
 
 def update_query_params():
-    """Update query parameters to persist session state across refreshes."""
+    """Update query parameters to persist session state across refreshes.
+
+    Security rules:
+    - Never write raw username/uid/role into the URL.
+    - If Fernet is available create an encrypted `session` token containing user, role, uid and timestamp.
+    - Always include a non-sensitive `consent` param.
+    - If no authenticated user, clear session token from URL but preserve consent if present.
+    """
+    consent_val = "1" if st.session_state.get("consent_given") else "0"
+
+    # If there's an authenticated user and encryption available, write a secure token
     if st.session_state.auth_user:
-        st.query_params.update({
-            "user": st.session_state.auth_user,
-            "role": st.session_state.role,
-            "uid": str(st.session_state.user_id),
-            "consent": "1" if st.session_state.consent_given else "0"
-        })
+        f = get_fernet()
+        if f is not None:
+            payload = {
+                "user": st.session_state.auth_user,
+                "role": st.session_state.role,
+                "uid": str(st.session_state.user_id),
+                "ts": time.time(),
+            }
+            try:
+                token = encrypt_value(json.dumps(payload), f)
+                st.experimental_set_query_params(session=token, consent=consent_val)
+            except Exception:
+                # If encryption somehow fails, do not expose sensitive info — write only consent
+                st.experimental_set_query_params(consent=consent_val)
+        else:
+            # No encryption available: do not include session info in URL
+            st.experimental_set_query_params(consent=consent_val)
     else:
-        st.query_params.clear()
+        # Not authenticated: clear session token but keep consent
+        st.experimental_set_query_params(consent=consent_val)
 
 
 def mark_action():
@@ -393,7 +447,7 @@ def show_login():
         st.markdown("<br>", unsafe_allow_html=True)
         
         # Back button
-        if st.button("← Back to Options", key="back_to_choice", use_container_width=True):
+        if st.button("← Back to Options", use_container_width=True):
             st.session_state.show_signup = None  # Reset to show choice screen
             st.rerun()
 
