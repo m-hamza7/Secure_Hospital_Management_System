@@ -36,6 +36,9 @@ from db import (
     export_patients_csv,
     count_soft_deletes_older_than,
     purge_soft_deletes_older_than,
+    get_total_patients_count,
+    get_active_users_count,
+    signup_user,
 )
 from security import verify_password, get_fernet, encrypt_value, is_encrypted
 
@@ -57,6 +60,48 @@ if "consent_given" not in st.session_state:
     st.session_state.consent_given = False
 if "consent_declined" not in st.session_state:
     st.session_state.consent_declined = False
+if "session_initialized" not in st.session_state:
+    st.session_state.session_initialized = False
+if "show_signup" not in st.session_state:
+    st.session_state.show_signup = None  # None = show choice, True = signup, False = login
+
+
+def init_session_from_query_params():
+    """Initialize session state from query parameters to persist across refreshes."""
+    if not st.session_state.session_initialized:
+        query_params = st.query_params
+        
+        # Restore auth state from query params
+        if "user" in query_params and "role" in query_params and "uid" in query_params:
+            username = query_params["user"]
+            role = query_params["role"]
+            user_id = query_params["uid"]
+            
+            # Verify the user still exists in database
+            try:
+                user_row = get_user_by_username(username)
+                if user_row and str(user_row["user_id"]) == user_id and user_row["role"] == role:
+                    st.session_state.auth_user = username
+                    st.session_state.role = role
+                    st.session_state.user_id = int(user_id)
+                    st.session_state.consent_given = query_params.get("consent", "0") == "1"
+            except Exception:
+                pass  # Fail silently and require re-login
+        
+        st.session_state.session_initialized = True
+
+
+def update_query_params():
+    """Update query parameters to persist session state across refreshes."""
+    if st.session_state.auth_user:
+        st.query_params.update({
+            "user": st.session_state.auth_user,
+            "role": st.session_state.role,
+            "uid": str(st.session_state.user_id),
+            "consent": "1" if st.session_state.consent_given else "0"
+        })
+    else:
+        st.query_params.clear()
 
 
 def mark_action():
@@ -95,64 +140,262 @@ def show_consent_banner() -> None:
     # If a choice was already made, do nothing
     if st.session_state.get("consent_given") or st.session_state.get("consent_declined"):
         return
-
-    st.info("We use audit logging for actions (login, view, edit) and provide anonymization features.\nPlease provide your consent to proceed.")
-    cols = st.columns([1, 1, 6])
-    with cols[2]:
-        st.write("By accepting you agree to in-app audit logging and anonymization processes for GDPR/compliance demos. You can decline to opt-out of the demo; declining will disable interactive features.")
-    with cols[0]:
-        if st.button("Accept", key="consent_accept"):
-            st.session_state.consent_given = True
-            st.session_state.consent_declined = False
-            try:
-                log_action(st.session_state.get("user_id"), st.session_state.get("role"), "consent_accepted", "user_accepted_consent")
-            except Exception:
-                # logging should not interrupt UX
-                pass
-            mark_action()
-            st.rerun()
-    with cols[1]:
-        if st.button("Decline", key="consent_decline"):
-            st.session_state.consent_given = False
-            st.session_state.consent_declined = True
-            try:
-                log_action(st.session_state.get("user_id"), st.session_state.get("role"), "consent_declined", "user_declined_consent")
-            except Exception:
-                pass
-            mark_action()
-            st.rerun()
+    
+    # Center the consent banner
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                    padding: 2.5rem; 
+                    border-radius: 20px; 
+                    border: 2px solid #d4af37;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.5);">
+            <div style="text-align: center; margin-bottom: 1.5rem;">
+                <h2 style="color: #d4af37; margin: 0; font-size: 1.8rem;">
+                    🔒 Privacy & Data Usage Consent
+                </h2>
+            </div>
+            <div style="background: rgba(22, 33, 62, 0.6); 
+                        padding: 1.5rem; 
+                        border-radius: 12px; 
+                        border-left: 4px solid #3b82f6;
+                        margin-bottom: 1.5rem;">
+                <p style="color: #e8e8e8; font-size: 1rem; line-height: 1.6; margin: 0;">
+                    <strong style="color: #d4af37;">📋 We collect and process:</strong><br>
+                    • Audit logs of all user actions (login, view, edit, delete)<br>
+                    • Patient data anonymization for GDPR compliance demos<br>
+                    • User authentication and session information
+                </p>
+            </div>
+            <div style="background: rgba(22, 33, 62, 0.6); 
+                        padding: 1.5rem; 
+                        border-radius: 12px; 
+                        border-left: 4px solid #10b981;
+                        margin-bottom: 1.5rem;">
+                <p style="color: #e8e8e8; font-size: 0.95rem; line-height: 1.6; margin: 0;">
+                    <strong style="color: #d4af37;">🛡️ Your Rights:</strong><br>
+                    This is a demonstration system for educational purposes. By accepting, you consent to 
+                    in-app audit logging and anonymization processes for GDPR/compliance demonstrations.
+                </p>
+            </div>
+            <p style="color: #f59e0b; font-size: 0.9rem; text-align: center; margin-bottom: 1.5rem;">
+                ⚠️ Declining consent will disable all interactive features
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("✅ I Accept", key="consent_accept", use_container_width=True):
+                st.session_state.consent_given = True
+                st.session_state.consent_declined = False
+                try:
+                    log_action(st.session_state.get("user_id"), st.session_state.get("role"), "consent_accepted", "user_accepted_consent")
+                except Exception:
+                    pass
+                mark_action()
+                update_query_params()
+                st.rerun()
+        with col_b:
+            if st.button("❌ I Decline", key="consent_decline", use_container_width=True):
+                st.session_state.consent_given = False
+                st.session_state.consent_declined = True
+                try:
+                    log_action(st.session_state.get("user_id"), st.session_state.get("role"), "consent_declined", "user_declined_consent")
+                except Exception:
+                    pass
+                mark_action()
+                update_query_params()
+                st.rerun()
 
 
 # ----------------------------------------------------------------------------
 # Authentication Component
 # ----------------------------------------------------------------------------
-def show_login():
-    st.subheader("Login")
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login")
-    if submitted:
-        try:
-            user_row = get_user_by_username(username)
-            if not user_row:
-                st.warning("Invalid credentials.")
-                log_action(None, None, "login_failed", f"username={username}")
-                return
-            if verify_password(password, user_row["salt"], user_row["password_hash"]):
-                st.session_state.auth_user = user_row["username"]
-                st.session_state.role = user_row["role"]
-                st.session_state.user_id = user_row["user_id"]
-                log_action(user_row["user_id"], user_row["role"], "login", f"user={username}")
-                mark_action()
-                st.success(f"Logged in as {user_row['role']}")
+def show_auth_choice():
+    """Display login/signup choice screen after consent is given."""
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                    padding: 2.5rem; 
+                    border-radius: 20px; 
+                    border: 2px solid #d4af37;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+                    text-align: center;">
+            <h1 style="color: #d4af37; margin-bottom: 0.5rem;">🏥 Hospital Management System</h1>
+            <p style="color: #e8e8e8; font-size: 1.1rem; margin-bottom: 2rem;">
+                Secure Healthcare Data Management
+            </p>
+            <p style="color: #d4af37; font-size: 0.95rem; margin-bottom: 2rem;">
+                Please choose an option to continue
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("🔑 Login", key="choice_login", use_container_width=True, help="Login to your existing account"):
+                st.session_state.show_signup = False
                 st.rerun()
-            else:
-                st.warning("Invalid credentials.")
-                log_action(user_row["user_id"], user_row["role"], "login_failed", "bad_password")
-        except Exception as e:
-            secure_error_box(e)
-            log_action(None, None, "login_error", traceback.format_exc())
+        with col_b:
+            if st.button("📝 Sign Up", key="choice_signup", use_container_width=True, help="Create a new account"):
+                st.session_state.show_signup = True
+                st.rerun()
+
+
+def show_signup():
+    """Display signup form for new users to create an account."""
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([0.5, 2, 0.5])
+    with col2:
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                    padding: 2rem; 
+                    border-radius: 20px; 
+                    border: 2px solid #d4af37;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.5);">
+            <div style="text-align: center; margin-bottom: 1.5rem;">
+                <h2 style="color: #d4af37; margin: 0;">📝 Create New Account</h2>
+                <p style="color: #e8e8e8; font-size: 0.9rem; margin-top: 0.5rem;">
+                    Register as a Doctor or Receptionist
+                </p>
+            </div>        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        with st.form("signup_form"):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                first_name = st.text_input("First Name *", placeholder="Enter your first name")
+            with col_b:
+                last_name = st.text_input("Last Name *", placeholder="Enter your last name")
+            
+            contact = st.text_input("Contact (Email or Phone) *", placeholder="email@example.com or +1234567890")
+            
+            st.markdown("**Select Role:**")
+            role = st.radio(
+                "Role *",
+                options=["receptionist", "doctor"],
+                format_func=lambda x: x.capitalize(),
+                horizontal=True,
+                label_visibility="collapsed"
+            )
+            
+            username = st.text_input("Username *", placeholder="Choose a unique username")
+            password = st.text_input("Password *", type="password", placeholder="Minimum 6 characters")
+            confirm_password = st.text_input("Confirm Password *", type="password", placeholder="Re-enter your password")
+            
+            st.caption("* All fields are required")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                submitted = st.form_submit_button("🎯 Create Account", use_container_width=True)
+            with col2:
+                cancel = st.form_submit_button("← Back to Options", use_container_width=True)
+    
+    if cancel:
+        st.session_state.show_signup = None  # Reset to show choice screen
+        st.rerun()
+    
+    if submitted:
+        # Validation
+        if not all([first_name, last_name, contact, username, password, confirm_password]):
+            st.error("❌ All fields are required.")
+            return
+        
+        if password != confirm_password:
+            st.error("❌ Passwords do not match. Please try again.")
+            return
+        
+        if len(password) < 6:
+            st.error("❌ Password must be at least 6 characters long.")
+            return
+        
+        # Attempt to create user
+        success, message = signup_user(first_name, last_name, contact, username, password, role)
+        
+        if success:
+            st.success(f"✅ {message}")
+            log_action(None, None, "signup_success", f"username={username}, role={role}")
+            st.info("🔑 You can now login with your credentials.")
+            time.sleep(2)
+            st.session_state.show_signup = False
+            st.rerun()
+        else:
+            st.error(f"❌ {message}")
+            log_action(None, None, "signup_failed", f"username={username}, error={message}")
+
+
+def show_login():
+    """Display login form with constrained width."""
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # Center the login form with max width
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                    padding: 2rem; 
+                    border-radius: 20px; 
+                    border: 2px solid #d4af37;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+                    max-width: 500px;
+                    margin: 0 auto;">
+            <div style="text-align: center; margin-bottom: 1.5rem;">
+                <h2 style="color: #d4af37; margin: 0;">🔐 Login</h2>
+                <p style="color: #e8e8e8; font-size: 0.9rem; margin-top: 0.5rem;">
+                    Enter your credentials to access the system
+                </p>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        with st.form("login_form"):
+            username = st.text_input("👤 Username", placeholder="Enter your username")
+            password = st.text_input("🔒 Password", type="password", placeholder="Enter your password")
+            submitted = st.form_submit_button("🚀 Login", use_container_width=True)
+        
+        if submitted:
+            try:
+                user_row = get_user_by_username(username)
+                if not user_row:
+                    st.error("❌ Invalid credentials. Please check your username and password.")
+                    log_action(None, None, "login_failed", f"username={username}")
+                    return
+                if verify_password(password, user_row["salt"], user_row["password_hash"]):
+                    st.session_state.auth_user = user_row["username"]
+                    st.session_state.role = user_row["role"]
+                    st.session_state.user_id = user_row["user_id"]
+                    log_action(user_row["user_id"], user_row["role"], "login", f"user={username}")
+                    mark_action()
+                    update_query_params()
+                    st.success(f"✅ Logged in as {user_row['role']}")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("❌ Invalid credentials. Please check your username and password.")
+                    log_action(user_row["user_id"], user_row["role"], "login_failed", "bad_password")
+            except Exception as e:
+                secure_error_box(e)
+                log_action(None, None, "login_error", traceback.format_exc())
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        # Back button
+        if st.button("← Back to Options", key="back_to_choice", use_container_width=True):
+            st.session_state.show_signup = None  # Reset to show choice screen
+            st.rerun()
 
 
 def logout():
@@ -161,7 +404,220 @@ def logout():
     st.session_state.role = None
     st.session_state.user_id = None
     mark_action()
+    update_query_params()
     st.rerun()
+
+
+# ----------------------------------------------------------------------------
+# Analytics Overview (Admin)
+# ----------------------------------------------------------------------------
+def analytics_overview():
+    """Display analytics overview for admin users with key metrics."""
+    st.subheader("📊 Analytics Overview")
+    
+    try:
+        # Fetch data
+        total_patients = get_total_patients_count()
+        logs_data = list_logs(limit=10000)
+        total_logs = len(logs_data)
+        active_users = get_active_users_count()
+        uptime_seconds = int(time.time() - st.session_state.app_start)
+        
+        # Calculate time-based metrics
+        df = pd.DataFrame(logs_data)
+        if not df.empty:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            df = df.dropna(subset=["timestamp"])
+            
+            # Get current time in UTC
+            now_utc = pd.Timestamp.now(tz='UTC')
+            today_start = now_utc.normalize()  # Midnight today
+            last_24h_start = now_utc - pd.Timedelta(hours=24)
+            
+            # Filter for different time periods
+            activities_last_24h = len(df[df["timestamp"] >= last_24h_start])
+            activities_today = len(df[df["timestamp"] >= today_start])
+        else:
+            activities_last_24h = 0
+            activities_today = 0
+        
+        # Display metrics in cards
+        st.markdown("### System Overview")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                        padding: 1.5rem; border-radius: 15px; 
+                        border-left: 5px solid #d4af37; 
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+                <div style="color: #d4af37; font-size: 0.85rem; font-weight: 600; 
+                           text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem;">
+                    👥 Total Patients
+                </div>
+                <div style="color: #ffffff; font-size: 2.5rem; font-weight: 700;">
+                    {total_patients}
+                </div>
+                <div style="color: #e8e8e8; font-size: 0.75rem; opacity: 0.7; margin-top: 0.5rem;">
+                    Active records
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                        padding: 1.5rem; border-radius: 15px; 
+                        border-left: 5px solid #10b981; 
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+                <div style="color: #10b981; font-size: 0.85rem; font-weight: 600; 
+                           text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem;">
+                    📝 Total Logs
+                </div>
+                <div style="color: #ffffff; font-size: 2.5rem; font-weight: 700;">
+                    {total_logs}
+                </div>
+                <div style="color: #e8e8e8; font-size: 0.75rem; opacity: 0.7; margin-top: 0.5rem;">
+                    Audit entries
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                        padding: 1.5rem; border-radius: 15px; 
+                        border-left: 5px solid #3b82f6; 
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+                <div style="color: #3b82f6; font-size: 0.85rem; font-weight: 600; 
+                           text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem;">
+                    👤 Active Users
+                </div>
+                <div style="color: #ffffff; font-size: 2.5rem; font-weight: 700;">
+                    {active_users}
+                </div>
+                <div style="color: #e8e8e8; font-size: 0.75rem; opacity: 0.7; margin-top: 0.5rem;">
+                    Unique users
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col4:
+            uptime_str = str(timedelta(seconds=uptime_seconds))
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                        padding: 1.5rem; border-radius: 15px; 
+                        border-left: 5px solid #f59e0b; 
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+                <div style="color: #f59e0b; font-size: 0.85rem; font-weight: 600; 
+                           text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem;">
+                    ⏱️ System Uptime
+                </div>
+                <div style="color: #ffffff; font-size: 1.5rem; font-weight: 700;">
+                    {uptime_str}
+                </div>
+                <div style="color: #e8e8e8; font-size: 0.75rem; opacity: 0.7; margin-top: 0.5rem;">
+                    Running time
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        # Activity Analysis
+        st.markdown("### Activity Analysis")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                        padding: 1.5rem; border-radius: 15px; 
+                        border: 2px solid rgba(212, 175, 55, 0.3);
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+                <div style="color: #d4af37; font-size: 0.85rem; font-weight: 600; 
+                           text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem;">
+                    📅 Today's Activities
+                </div>
+                <div style="color: #ffffff; font-size: 2.5rem; font-weight: 700;">
+                    {activities_today}
+                </div>
+                <div style="color: #e8e8e8; font-size: 0.75rem; opacity: 0.7; margin-top: 0.5rem;">
+                    Since midnight UTC
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                        padding: 1.5rem; border-radius: 15px; 
+                        border: 2px solid rgba(139, 92, 246, 0.3);
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+                <div style="color: #8b5cf6; font-size: 0.85rem; font-weight: 600; 
+                           text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem;">
+                    🕐 Last 24 Hours
+                </div>
+                <div style="color: #ffffff; font-size: 2.5rem; font-weight: 700;">
+                    {activities_last_24h}
+                </div>
+                <div style="color: #e8e8e8; font-size: 0.75rem; opacity: 0.7; margin-top: 0.5rem;">
+                    Rolling 24h window
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            avg_per_day = total_logs / max(1, uptime_seconds / 86400) if uptime_seconds > 0 else 0
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                        padding: 1.5rem; border-radius: 15px; 
+                        border: 2px solid rgba(16, 185, 129, 0.3);
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+                <div style="color: #10b981; font-size: 0.85rem; font-weight: 600; 
+                           text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem;">
+                    📈 Avg Per Day
+                </div>
+                <div style="color: #ffffff; font-size: 2.5rem; font-weight: 700;">
+                    {avg_per_day:.1f}
+                </div>
+                <div style="color: #e8e8e8; font-size: 0.75rem; opacity: 0.7; margin-top: 0.5rem;">
+                    Average activities
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        # Quick insights
+        if not df.empty:
+            st.markdown("### 📌 Quick Insights")
+            
+            # Most active user today
+            today_logs = df[df["timestamp"] >= today_start]
+            if not today_logs.empty:
+                from db import get_username_by_id
+                today_logs["username"] = today_logs["user_id"].apply(
+                    lambda uid: get_username_by_id(uid) or f"user_{uid}"
+                )
+                top_user_today = today_logs["username"].value_counts().head(1)
+                
+                if len(top_user_today) > 0:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.info(f"🏆 **Most Active Today:** {top_user_today.index[0]} ({top_user_today.values[0]} actions)")
+                    
+                    # Most common action today
+                    top_action = today_logs["action"].value_counts().head(1)
+                    with col2:
+                        if len(top_action) > 0:
+                            st.info(f"⚡ **Top Action Today:** {top_action.index[0]} ({top_action.values[0]} times)")
+        
+        log_action(st.session_state.user_id, st.session_state.role, "view_analytics", "viewed_overview")
+        mark_action()
+        
+    except Exception as e:
+        secure_error_box(e)
+        log_action(st.session_state.user_id, st.session_state.role, "view_analytics_error", traceback.format_exc())
 
 
 # ----------------------------------------------------------------------------
@@ -638,6 +1094,9 @@ def scheduled_purge_panel():
 def main():
     st.set_page_config(page_title="Hospital Security Dashboard", layout="wide")
     
+    # Initialize session from query parameters (for persistence across refreshes)
+    init_session_from_query_params()
+    
     # Apply global CSS theme to entire website
     st.markdown("""
         <style>
@@ -946,8 +1405,7 @@ def main():
             border: 1px solid #d4af37 !important;
             box-shadow: 0 4px 16px rgba(212, 175, 55, 0.5);
         }
-        
-        .stTabs [data-baseweb="tab-panel"] {
+          .stTabs [data-baseweb="tab-panel"] {
             padding-top: 2rem;        }
         </style>
     """, unsafe_allow_html=True)
@@ -961,10 +1419,24 @@ def main():
         st.warning("You declined consent for audit logging/anonymization. The demo is disabled. Contact an administrator to proceed.")
         footer()
         return
-
+    
+    # If consent not given yet, don't proceed to login/signup
+    if not st.session_state.get("consent_given"):
+        footer()
+        return
+    
     # Check if user is authenticated
     if not st.session_state.auth_user:
-        show_login()
+        # Show login/signup choice or the selected form
+        if st.session_state.show_signup is None:
+            # User hasn't chosen yet, show choice screen
+            show_auth_choice()
+        elif st.session_state.show_signup is True:
+            # User wants to sign up
+            show_signup()
+        else:
+            # User wants to login
+            show_login()
         footer()
         return
 
@@ -994,6 +1466,8 @@ def main():
                 logs_view()
             elif tab_name == "Activity Graphs" and st.session_state.role == "admin":
                 activity_panel()
+            elif tab_name == "Analytics Overview" and st.session_state.role == "admin":
+                analytics_overview()
             elif tab_name == "Manage Deleted" and st.session_state.role == "admin":
                 deleted_management_panel()
             elif tab_name == "Scheduled Purge" and st.session_state.role == "admin":
@@ -1008,7 +1482,8 @@ def main():
 def _sidebar_options_for_role(role: str):
     base = ["Patient Records"]
     if role == "admin":
-        base += ["Anonymize Data", "Audit Logs", "Backup / Export CSV", "Activity Graphs", "Manage Deleted", "Scheduled Purge"]
+        base = ["Analytics Overview"]
+        base += ["Patient Records","Anonymize Data", "Audit Logs", "Backup / Export CSV", "Activity Graphs", "Manage Deleted", "Scheduled Purge"]
     return ["Login"] + base if st.session_state.auth_user is None else base
 
 

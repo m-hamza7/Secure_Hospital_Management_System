@@ -50,7 +50,10 @@ def init_db() -> None:
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
-            role TEXT NOT NULL
+            role TEXT NOT NULL,
+            first_name TEXT,
+            last_name TEXT,
+            contact TEXT
         )
         """
     )
@@ -382,6 +385,24 @@ def count_soft_deletes_older_than(days: int) -> int:
     return int(val)
 
 
+def get_total_patients_count() -> int:
+    """Return total count of active (non-deleted) patients."""
+    conn = get_connection()
+    cur = conn.execute("SELECT COUNT(*) AS c FROM patients WHERE COALESCE(deleted,0)=0")
+    val = cur.fetchone()["c"]
+    conn.close()
+    return int(val)
+
+
+def get_active_users_count() -> int:
+    """Return count of unique users who have performed actions."""
+    conn = get_connection()
+    cur = conn.execute("SELECT COUNT(DISTINCT user_id) AS c FROM logs WHERE user_id IS NOT NULL")
+    val = cur.fetchone()["c"]
+    conn.close()
+    return int(val)
+
+
 def purge_soft_deletes_older_than(days: int) -> int:
     """Permanently delete soft-deleted patients older than `days`. Returns count removed."""
     try:
@@ -423,8 +444,70 @@ def ensure_deleted_column_exists() -> None:
         except Exception:
             pass
 
+
+def ensure_user_profile_columns_exist() -> None:
+    """Add first_name, last_name, and contact columns to users table if they don't exist."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(users)")
+        cols = [r[1] for r in cur.fetchall()]
+        
+        if 'first_name' not in cols:
+            cur.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
+        if 'last_name' not in cols:
+            cur.execute("ALTER TABLE users ADD COLUMN last_name TEXT")
+        if 'contact' not in cols:
+            cur.execute("ALTER TABLE users ADD COLUMN contact TEXT")
+        
+        conn.commit()
+        conn.close()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def signup_user(first_name: str, last_name: str, contact: str, username: str, password: str, role: str) -> Tuple[bool, str]:
+    """
+    Create a new user account with profile information.
+    Returns: (success: bool, message: str)
+    """
+    try:
+        # Validate inputs
+        if not all([first_name, last_name, contact, username, password, role]):
+            return False, "All fields are required."
+        
+        if role not in ['doctor', 'receptionist']:
+            return False, "Invalid role. Must be 'doctor' or 'receptionist'."
+        
+        if len(password) < 6:
+            return False, "Password must be at least 6 characters long."
+        
+        # Check if username already exists
+        existing_user = get_user_by_username(username)
+        if existing_user:
+            return False, "Username already exists. Please choose a different username."
+        
+        # Create user with profile info
+        salt = generate_salt()
+        pwd_hash = hash_password(password, salt)
+        conn = get_connection()
+        conn.execute(
+            "INSERT INTO users(username, password_hash, salt, role, first_name, last_name, contact) VALUES(?,?,?,?,?,?,?)",
+            (username, pwd_hash, salt, role, first_name, last_name, contact),
+        )
+        conn.commit()
+        conn.close()
+        return True, "Account created successfully! Please login with your credentials."
+    except Exception as e:
+        return False, f"Failed to create account: {str(e)}"
+
+
 # Initialize database at import time (first run convenience)
 if not os.path.exists(DB_FILE):
     init_db()
 # Make sure column exists for older DB files as well
 ensure_deleted_column_exists()
+ensure_user_profile_columns_exist()
